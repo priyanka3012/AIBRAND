@@ -1,0 +1,413 @@
+"""
+Brand mention counter — v3.
+
+Outputs:
+1. Enriched raw-responses CSV:
+     - all original columns
+     - `mentions` column listing every brand found in that row
+     - `Mentioned` column — "Yes" if TARGET_BRAND is in the row, "No" otherwise
+2. Brand summary XLSX with two sheets:
+     Sheet 1 "Brand Summary"    — rows_mentioned, total_mentions, pct, SoV
+     Sheet 2 "Domain Analysis"  — unique domains cited, total count + pct,
+                                  plus per-week count + pct (wide format)
+                                  so week-on-week source drift is easy to scan.
+"""
+
+import os
+import re
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import pandas as pd
+
+
+# =========================
+# CONFIG
+# =========================
+
+INPUT_FILE = r"C:\Users\pcn801\OneDrive - Sky\Media Strategy - Documents\Measurement Projects\2026\AI-ChatGPT\02. Excel Outputs\01.Updated_Analysis\5.3_OUPUTS\5.3_outputs.csv"
+
+OUTPUT_DIR = r"C:\Users\pcn801\OneDrive - Sky\Media Strategy - Documents\Measurement Projects\2026\AI-ChatGPT\02. Excel Outputs\01.Updated_Analysis\5.3_OUPUTS"
+
+OUTPUT_ENRICHED_CSV = os.path.join(OUTPUT_DIR, "raw_responses_with_mentions.csv")
+OUTPUT_SUMMARY_XLSX = os.path.join(OUTPUT_DIR, "brand_and_domain_summary.xlsx")
+OUTPUT_AUDIT_CSV    = os.path.join(OUTPUT_DIR, "brand_match_audit.csv")
+OUTPUT_JSON         = os.path.join(OUTPUT_DIR, "brand_counts.json")
+
+# Column indexes in the no-header CSV
+COL_RESPONSE     = 3   # D — main response text
+COL_CITATION_URL = 5   # F — pipe-separated URLs
+COL_SOURCE_FILE  = 8   # I — source filename, used to derive week
+
+
+def index_to_excel_col(idx):
+    idx += 1
+    letters = ""
+    while idx > 0:
+        idx, remainder = divmod(idx - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def generate_column_names(ncols):
+    return [f"col_{index_to_excel_col(i)}" for i in range(ncols)]
+
+# Brand used for the "Mentioned" Yes/No column in the enriched CSV
+TARGET_BRAND = "Sky"
+
+
+# =========================
+# BRAND DICTIONARY
+# =========================
+
+BRANDS = {
+    "Sky":             ["Sky", "Sky Broadband"],
+    "Virgin Media":    ["Virgin Media", "Virgin"],
+    "BT":              ["BT", "BT Broadband", "BT Full Fibre"],
+    "TalkTalk":        ["TalkTalk"],
+    "Plusnet":         ["Plusnet"],
+    "Vodafone":        ["Vodafone"],
+    "EE":              ["EE", "EE Broadband"],
+    "Hyperoptic":      ["Hyperoptic"],
+    "Zen Internet":    ["Zen Internet", "Zen"],
+    "Community Fibre": ["Community Fibre"],
+    "NOW Broadband":   ["NOW Broadband", "NOW"],
+    "YouFibre":        ["YouFibre"],
+    "Openreach":       ["Openreach"],
+    "Gigaclear":       ["Gigaclear"],
+    "Three":           ["Three"],
+    "Cuckoo":          ["Cuckoo"],
+}
+
+CASE_SENSITIVE_BRANDS = {"EE", "BT", "NOW Broadband", "Three"}
+
+
+# =========================
+# TEXT CLEANING
+# =========================
+
+def clean_text(text):
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", text)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = text.replace("**", " ").replace("__", " ").replace("`", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# =========================
+# PATTERN BUILDING
+# =========================
+
+def build_patterns(brands):
+    patterns = {}
+    for brand, aliases in brands.items():
+        aliases_sorted = sorted(aliases, key=len, reverse=True)
+        compiled = []
+        for alias in aliases_sorted:
+            pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
+            flags = 0 if brand in CASE_SENSITIVE_BRANDS else re.IGNORECASE
+            compiled.append((alias, re.compile(pattern, flags)))
+        patterns[brand] = compiled
+    return patterns
+
+
+# =========================
+# BRAND MATCHING
+# =========================
+
+def count_brand_mentions_in_text(text, patterns):
+    """Returns (brand_counts, alias_counts, has_brand) for one text."""
+    brand_counts = defaultdict(int)
+    alias_counts = defaultdict(int)
+    has_brand = {}
+
+    for brand, compiled_patterns in patterns.items():
+        remaining = text
+        brand_total = 0
+        for alias, pattern in compiled_patterns:
+            matches = pattern.findall(remaining)
+            n = len(matches)
+            if n:
+                alias_counts[(brand, alias)] += n
+                brand_total += n
+                # Strip the matched spans so shorter aliases of the same brand
+                # (e.g. "Virgin" inside "Virgin Media") don't double-count.
+                remaining = pattern.sub(" ", remaining)
+        brand_counts[brand] = brand_total
+        has_brand[brand] = brand_total > 0
+
+    return brand_counts, alias_counts, has_brand
+
+
+# =========================
+# DOMAIN EXTRACTION
+# =========================
+
+def extract_domain(url):
+    """Normalise a URL to a comparable domain: lowercase, strip leading www."""
+    try:
+        netloc = urlparse(url.strip()).netloc.lower()
+    except Exception:
+        return None
+    if not netloc:
+        return None
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def extract_domains_from_cell(cell):
+    """Split a pipe-separated URL cell and return a list of normalised domains."""
+    if not isinstance(cell, str) or not cell.strip():
+        return []
+    urls = [u.strip() for u in cell.split("|") if u.strip()]
+    domains = [extract_domain(u) for u in urls]
+    return [d for d in domains if d]
+
+
+# =========================
+# WEEK LABEL FROM SOURCE FILE
+# =========================
+
+def week_label_from_source_file(source_file):
+    """
+    source_file like 'Analysedv2_raw_results_20260323_134013.xlsx'
+    → '2026-03-23'. Falls back to raw filename if no date found.
+    """
+    if not isinstance(source_file, str):
+        return "unknown"
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", source_file)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return source_file
+
+
+# =========================
+# ANALYSIS
+# =========================
+
+def analyse(df, resp_col, url_col, src_col):
+    texts = df[resp_col].fillna("").astype(str).apply(clean_text).tolist()
+    url_cells = df[url_col].fillna("").astype(str).tolist()
+    source_files = df[src_col].fillna("unknown").astype(str).tolist()
+    week_labels = [week_label_from_source_file(s) for s in source_files]
+
+    patterns = build_patterns(BRANDS)
+    all_brands = list(BRANDS.keys())
+
+    # Brand aggregates
+    rows_mentioned = defaultdict(int)
+    total_mentions = defaultdict(int)
+    alias_totals = defaultdict(int)
+
+    # Per-row outputs
+    mentions_col = []
+    target_yes_no = []
+    audit_rows = []
+
+    # Domain aggregates: domain -> total, and (domain, week) -> count
+    domain_total = defaultdict(int)
+    domain_by_week = defaultdict(int)
+    week_totals = defaultdict(int)  # total domain mentions per week (denominator)
+
+    for i, (text, url_cell, wk) in enumerate(zip(texts, url_cells, week_labels)):
+        # Brand matching
+        brand_counts, alias_counts, has_brand = count_brand_mentions_in_text(text, patterns)
+        for brand in all_brands:
+            if has_brand.get(brand):
+                rows_mentioned[brand] += 1
+            total_mentions[brand] += brand_counts.get(brand, 0)
+        for (brand, alias), n in alias_counts.items():
+            alias_totals[(brand, alias)] += n
+            audit_rows.append({
+                "row_number": i + 1,
+                "brand": brand,
+                "alias_matched": alias,
+                "occurrences_in_row": n,
+            })
+
+        mentioned_brands = [b for b in all_brands if has_brand.get(b)]
+        mentions_col.append(", ".join(mentioned_brands))
+        target_yes_no.append("Yes" if has_brand.get(TARGET_BRAND) else "No")
+
+        # Domain extraction — count every occurrence (including duplicates in the cell)
+        for d in extract_domains_from_cell(url_cell):
+            domain_total[d] += 1
+            domain_by_week[(d, wk)] += 1
+            week_totals[wk] += 1
+
+    return {
+        "rows_mentioned":  rows_mentioned,
+        "total_mentions":  total_mentions,
+        "alias_totals":    alias_totals,
+        "mentions_col":    mentions_col,
+        "target_yes_no":   target_yes_no,
+        "audit_rows":      audit_rows,
+        "domain_total":    domain_total,
+        "domain_by_week":  domain_by_week,
+        "week_totals":     week_totals,
+        "n_rows":          len(texts),
+    }
+
+
+# =========================
+# SUMMARY TABLES
+# =========================
+
+def build_brand_summary_df(res):
+    n_rows = res["n_rows"]
+    rm = res["rows_mentioned"]
+    tm = res["total_mentions"]
+    sum_rows = sum(rm.values()) or 1
+    sum_total = sum(tm.values()) or 1
+
+    rows = []
+    for brand in BRANDS.keys():
+        rows.append({
+            "brand": brand,
+            "rows_mentioned": rm.get(brand, 0),
+            "total_mentions": tm.get(brand, 0),
+            "mention_rate_pct":    round(rm.get(brand, 0) / n_rows * 100, 2) if n_rows else 0,
+            "sov_by_rows_pct":     round(rm.get(brand, 0) / sum_rows * 100, 2),
+            "sov_by_mentions_pct": round(tm.get(brand, 0) / sum_total * 100, 2),
+        })
+    return pd.DataFrame(rows).sort_values("total_mentions", ascending=False).reset_index(drop=True)
+
+
+def build_domain_summary_df(res):
+    """
+    Wide pivot:
+      domain | total_count | total_pct | <week1>_count | <week1>_pct | <week2>_count | ...
+    Percentages are within-column: each week's pct sums to ~100% across that week.
+    """
+    domain_total   = res["domain_total"]
+    domain_by_week = res["domain_by_week"]
+    week_totals    = res["week_totals"]
+
+    if not domain_total:
+        return pd.DataFrame(columns=["domain", "total_count", "total_pct"])
+
+    total_grand = sum(domain_total.values()) or 1
+    weeks = sorted(week_totals.keys())
+
+    rows = []
+    for domain in sorted(domain_total.keys(), key=lambda d: -domain_total[d]):
+        row = {
+            "domain": domain,
+            "total_count": domain_total[domain],
+            "total_pct": round(domain_total[domain] / total_grand * 100, 2),
+        }
+        for wk in weeks:
+            count = domain_by_week.get((domain, wk), 0)
+            wk_total = week_totals.get(wk, 0) or 1
+            row[f"{wk}_count"] = count
+            row[f"{wk}_pct"]   = round(count / wk_total * 100, 2)
+        rows.append(row)
+
+    cols = ["domain", "total_count", "total_pct"] + \
+           [f"{wk}_{suffix}" for wk in weeks for suffix in ("count", "pct")]
+    return pd.DataFrame(rows)[cols]
+
+
+# =========================
+# OUTPUT
+# =========================
+
+def save_enriched_csv(df, mentions_col, target_yes_no, output_file):
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    out = df.copy()
+    out["mentions"] = mentions_col
+    out["Mentioned"] = target_yes_no
+    out.to_csv(output_file, index=False, encoding="utf-8-sig")
+
+
+def save_summary_xlsx(brand_df, domain_df, output_file):
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        brand_df.to_excel(writer,  sheet_name="Brand Summary",   index=False)
+        domain_df.to_excel(writer, sheet_name="Domain Analysis", index=False)
+
+        # Light formatting: widen columns for readability
+        for sheet_name, df_ in (("Brand Summary", brand_df), ("Domain Analysis", domain_df)):
+            ws = writer.sheets[sheet_name]
+            for col_idx, col in enumerate(df_.columns, start=1):
+                max_len = max([len(str(col))] + [len(str(v)) for v in df_[col].astype(str).values])
+                ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 40)
+
+
+def save_audit_csv(audit_rows, output_file):
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    pd.DataFrame(audit_rows).to_csv(output_file, index=False, encoding="utf-8-sig")
+
+
+def save_json(res, brand_df, output_file):
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    payload = {
+        "run_metadata": {
+            "input_file": INPUT_FILE,
+            "output_created_at": datetime.now(timezone.utc).isoformat(),
+            "rows_analysed": res["n_rows"],
+            "target_brand_for_yes_no_column": TARGET_BRAND,
+        },
+        "brand_dictionary": BRANDS,
+        "case_sensitive_brands": sorted(list(CASE_SENSITIVE_BRANDS)),
+        "brand_summary": brand_df.to_dict(orient="records"),
+    }
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    ext = os.path.splitext(INPUT_FILE)[1].lower()
+    if ext == ".csv":
+        df = pd.read_csv(INPUT_FILE, header=None, dtype=str, keep_default_na=False)
+    elif ext in (".xlsx", ".xls"):
+        engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+        df = pd.read_excel(INPUT_FILE, header=None, dtype=str, engine=engine)
+    else:
+        raise ValueError("Unsupported file type")
+
+    # Minimal column sanity
+    required_max = max(COL_RESPONSE, COL_CITATION_URL, COL_SOURCE_FILE)
+    if df.shape[1] <= required_max:
+        raise ValueError(f"Input file needs at least {required_max + 1} columns")
+
+    # Generated column labels (col_A, col_B, ...) — same convention as your
+    # original script so the enriched CSV output shape doesn't change.
+    df.columns = generate_column_names(df.shape[1])
+    resp_col = df.columns[COL_RESPONSE]
+    url_col  = df.columns[COL_CITATION_URL]
+    src_col  = df.columns[COL_SOURCE_FILE]
+
+    print(f"Loaded {len(df)} rows from {INPUT_FILE}")
+    res = analyse(df, resp_col, url_col, src_col)
+
+    brand_df  = build_brand_summary_df(res)
+    domain_df = build_domain_summary_df(res)
+
+    save_enriched_csv(df, res["mentions_col"], res["target_yes_no"], OUTPUT_ENRICHED_CSV)
+    save_summary_xlsx(brand_df, domain_df, OUTPUT_SUMMARY_XLSX)
+    save_audit_csv(res["audit_rows"], OUTPUT_AUDIT_CSV)
+    save_json(res, brand_df, OUTPUT_JSON)
+
+    print(f"\nSaved:")
+    print(f"  Enriched CSV   → {OUTPUT_ENRICHED_CSV}")
+    print(f"  Summary XLSX   → {OUTPUT_SUMMARY_XLSX}")
+    print(f"  Audit CSV      → {OUTPUT_AUDIT_CSV}")
+    print(f"  JSON metadata  → {OUTPUT_JSON}")
+    print(f"\n--- Brand Summary ---")
+    print(brand_df.to_string(index=False))
+    print(f"\n--- Top 15 domains ---")
+    print(domain_df.head(15).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
